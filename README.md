@@ -1,11 +1,13 @@
-# Pacifica JS SDK
+# Pacifica JS SDK (Community)
 
 [![npm version](https://img.shields.io/npm/v/pacifica-js-sdk.svg)](https://www.npmjs.com/package/pacifica-js-sdk)
 [![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
 [![Production Grade](https://img.shields.io/badge/Status-Production%20Grade-green.svg)](https://pacifica.fi)
 
-Official production-ready JavaScript/TypeScript SDK for [Pacifica](https://pacifica.fi).
+Community-maintained production-ready JavaScript/TypeScript SDK for [Pacifica](https://pacifica.fi).
 Engineered for high-frequency trading bots, institutional integrations, and DeFi agents.
+
+> **Note:** This is an unofficial, community-maintained SDK. It is not affiliated with or endorsed by the Pacifica team.
 
 ## Features
 
