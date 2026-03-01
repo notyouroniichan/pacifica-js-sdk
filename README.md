@@ -1,16 +1,21 @@
 # Pacifica JS SDK
 
-Official JavaScript/TypeScript SDK for [Pacifica](https://pacifica.fi).
-Converted from the official [Python SDK](https://github.com/pacifica-fi/python-sdk).
+[![npm version](https://img.shields.io/npm/v/pacifica-js-sdk.svg)](https://www.npmjs.com/package/pacifica-js-sdk)
+[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
+[![Production Grade](https://img.shields.io/badge/Status-Production%20Grade-green.svg)](https://pacifica.fi)
+
+Official production-ready JavaScript/TypeScript SDK for [Pacifica](https://pacifica.fi).
+Engineered for high-frequency trading bots, institutional integrations, and DeFi agents.
 
 ## Features
 
-- 🔐 **Secure Authentication**: Ed25519 signing for all private operations.
+- 🔐 **Secure Authentication**: Ed25519 signing with runtime validation for keys.
 - 🤖 **Agent Wallets**: Native support for binding and using agent wallets for automated trading.
-- 📡 **Real-time Data**: WebSocket client for Prices, Tickers, Orderbooks, and Trades.
+- 📡 **Real-time Data**: Robust WebSocket client with auto-reconnection and exponential backoff.
 - ⚡ **Full Trading Suite**: Market, Limit, Stop-Loss, and Take-Profit orders.
-- 🛡️ **Robustness**: Automatic WebSocket reconnection and typed responses.
-- 📘 **TypeScript First**: Full type definitions for all API interactions.
+- 🛡️ **Error Handling**: Typed error classes (`PacificaError`, `NetworkError`) for predictable failure management.
+- 📘 **TypeScript First**: Strict type definitions for all API interactions.
+- ✅ **Tested**: Unit tested utilities and critical paths.
 
 ## Installation
 
@@ -27,18 +32,29 @@ Create a `.env` file (optional):
 PRIVATE_KEY=your_base58_private_key
 ```
 
- Initialize the client:
+ Initialize the client with error handling:
 
 ```typescript
-import { PacificaClient } from 'pacifica-js-sdk';
+import { PacificaClient, PacificaError } from 'pacifica-js-sdk';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const client = new PacificaClient({
-    privateKey: process.env.PRIVATE_KEY,
-    network: "mainnet" // or "testnet"
-});
+try {
+    const client = new PacificaClient({
+        privateKey: process.env.PRIVATE_KEY,
+        network: "mainnet" // or "testnet"
+    });
+
+    await client.connect();
+    console.log("Connected securely.");
+} catch (error) {
+    if (error instanceof PacificaError) {
+        console.error("Pacifica SDK Error:", error.message);
+    } else {
+        console.error("Unknown Error:", error);
+    }
+}
 ```
 
 ### Trading with Stop-Loss & Take-Profit

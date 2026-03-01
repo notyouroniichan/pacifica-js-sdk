@@ -27,6 +27,12 @@ import {
     Orderbook,
     Trade
 } from "./types.js";
+import { 
+    PacificaError, 
+    AuthenticationError, 
+    NetworkError, 
+    ValidationError 
+} from "./errors.js";
 
 export class PacificaClient extends EventEmitter {
     private keypair?: Keypair;
@@ -46,13 +52,21 @@ export class PacificaClient extends EventEmitter {
         
         // Initialize Main Account Keypair
         if (config.privateKey) {
-            this.keypair = Keypair.fromSecretKey(bs58.decode(config.privateKey));
+            try {
+                this.keypair = Keypair.fromSecretKey(bs58.decode(config.privateKey));
+            } catch (error) {
+                throw new ValidationError("Invalid private key format. Must be a valid Base58 string.");
+            }
         }
 
         // Initialize Agent Wallet Keypair
         if (config.agentWallet) {
-            this.agentWalletKeypair = Keypair.fromSecretKey(bs58.decode(config.agentWallet));
-            this.agentWalletPublicKey = this.agentWalletKeypair.publicKey.toBase58();
+            try {
+                this.agentWalletKeypair = Keypair.fromSecretKey(bs58.decode(config.agentWallet));
+                this.agentWalletPublicKey = this.agentWalletKeypair.publicKey.toBase58();
+            } catch (error) {
+                throw new ValidationError("Invalid agent wallet key format. Must be a valid Base58 string.");
+            }
         } else if (config.agentWalletPublicKey) {
             this.agentWalletPublicKey = config.agentWalletPublicKey;
         }
@@ -72,7 +86,8 @@ export class PacificaClient extends EventEmitter {
             baseURL: this.restUrl,
             headers: {
                 'Content-Type': 'application/json'
-            }
+            },
+            timeout: 10000 // 10s timeout
         });
     }
 
@@ -84,7 +99,7 @@ export class PacificaClient extends EventEmitter {
      */
     private signAndPrepareRequest(type: string, payload: SignaturePayload): SignedRequest {
         if (!this.keypair) {
-            throw new Error("Private key is required for signed operations");
+            throw new AuthenticationError("Private key is required for signed operations");
         }
 
         const timestamp = Date.now();
@@ -103,23 +118,27 @@ export class PacificaClient extends EventEmitter {
             isAgentSign = true;
         }
 
-        const { signature } = signMessage(header, payload, signer);
+        try {
+            const { signature } = signMessage(header, payload, signer);
 
-        const requestHeader: any = {
-            account: this.keypair.publicKey.toBase58(),
-            signature,
-            timestamp,
-            expiry_window: DEFAULT_EXPIRY_WINDOW
-        };
+            const requestHeader: any = {
+                account: this.keypair.publicKey.toBase58(),
+                signature,
+                timestamp,
+                expiry_window: DEFAULT_EXPIRY_WINDOW
+            };
 
-        if (isAgentSign && this.agentWalletPublicKey) {
-            requestHeader.agent_wallet = this.agentWalletPublicKey;
+            if (isAgentSign && this.agentWalletPublicKey) {
+                requestHeader.agent_wallet = this.agentWalletPublicKey;
+            }
+
+            return {
+                ...requestHeader,
+                ...payload
+            };
+        } catch (error: any) {
+             throw new PacificaError(`Signing failed: ${error.message}`);
         }
-
-        return {
-            ...requestHeader,
-            ...payload
-        };
     }
 
     // --- WebSocket Management ---
@@ -127,8 +146,13 @@ export class PacificaClient extends EventEmitter {
     public async connect(): Promise<void> {
         if (this.ws?.readyState === WebSocket.OPEN) return;
 
-        return new Promise((resolve) => {
-            this.ws = new WebSocket(this.wsUrl);
+        return new Promise((resolve, reject) => {
+            try {
+                this.ws = new WebSocket(this.wsUrl);
+            } catch (error: any) {
+                 reject(new NetworkError(`Failed to create WebSocket: ${error.message}`));
+                 return;
+            }
 
             this.ws.on('open', () => {
                 console.log(`Connected to Pacifica WebSocket: ${this.wsUrl}`);
@@ -168,7 +192,7 @@ export class PacificaClient extends EventEmitter {
     private handleReconnect() {
         console.log(`Reconnecting in ${this.reconnectDelay}ms...`);
         setTimeout(() => {
-            this.connect();
+            this.connect().catch(err => console.error("Reconnect attempt failed:", err));
             this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000); // Max 30s backoff
         }, this.reconnectDelay);
     }
@@ -185,7 +209,7 @@ export class PacificaClient extends EventEmitter {
         if (message.id && this.pendingRequests.has(message.id)) {
             const { resolve, reject } = this.pendingRequests.get(message.id)!;
             if (message.error) {
-                reject(new Error(message.error));
+                reject(new PacificaError(message.error));
             } else {
                 resolve(message.result);
             }
@@ -213,7 +237,7 @@ export class PacificaClient extends EventEmitter {
 
     private async sendWsRequest(method: string, params: any): Promise<any> {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            throw new Error("WebSocket not connected");
+            throw new NetworkError("WebSocket not connected");
         }
 
         const id = uuidv4();
@@ -232,7 +256,7 @@ export class PacificaClient extends EventEmitter {
             setTimeout(() => {
                 if (this.pendingRequests.has(id)) {
                     this.pendingRequests.delete(id);
-                    reject(new Error("Request timed out"));
+                    reject(new NetworkError("Request timed out"));
                 }
             }, 10000);
         });
