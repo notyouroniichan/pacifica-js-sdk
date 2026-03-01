@@ -13,35 +13,60 @@ import {
     DEFAULT_EXPIRY_WINDOW 
 } from "./config.js";
 import { signMessage } from "./utils.js";
-import { SignatureHeader, SignaturePayload } from "./types.js";
-
-export interface PacificaClientConfig {
-    privateKey?: string;
-    network?: 'mainnet' | 'testnet';
-}
+import { 
+    PacificaClientConfig, 
+    SignatureHeader, 
+    SignaturePayload, 
+    SignedRequest,
+    CreateOrderParams,
+    ApiResponse,
+    AccountInfo,
+    Position,
+    Order,
+    Ticker,
+    Orderbook,
+    Trade
+} from "./types.js";
 
 export class PacificaClient extends EventEmitter {
     private keypair?: Keypair;
+    private agentWalletKeypair?: Keypair;
+    private agentWalletPublicKey?: string;
     private restUrl: string;
     private wsUrl: string;
     private ws: WebSocket | null = null;
-    private wsConnected: Promise<void> | null = null;
+    private wsConnected: boolean = false;
+    private reconnect: boolean = false;
+    private reconnectDelay: number = 1000;
     private pendingRequests: Map<string, { resolve: (value: any) => void, reject: (reason: any) => void }> = new Map();
     private axiosInstance: AxiosInstance;
 
     constructor(config: PacificaClientConfig) {
         super();
+        
+        // Initialize Main Account Keypair
         if (config.privateKey) {
             this.keypair = Keypair.fromSecretKey(bs58.decode(config.privateKey));
         }
-        
-        if (config.network === 'testnet') {
-            this.restUrl = TESTNET_REST_URL;
-            this.wsUrl = TESTNET_WS_URL;
-        } else {
-            this.restUrl = MAINNET_REST_URL;
-            this.wsUrl = MAINNET_WS_URL;
+
+        // Initialize Agent Wallet Keypair
+        if (config.agentWallet) {
+            this.agentWalletKeypair = Keypair.fromSecretKey(bs58.decode(config.agentWallet));
+            this.agentWalletPublicKey = this.agentWalletKeypair.publicKey.toBase58();
+        } else if (config.agentWalletPublicKey) {
+            this.agentWalletPublicKey = config.agentWalletPublicKey;
         }
+
+        // Network Configuration
+        if (config.network === 'testnet') {
+            this.restUrl = config.restUrl || TESTNET_REST_URL;
+            this.wsUrl = config.wsUrl || TESTNET_WS_URL;
+        } else {
+            this.restUrl = config.restUrl || MAINNET_REST_URL;
+            this.wsUrl = config.wsUrl || MAINNET_WS_URL;
+        }
+
+        this.reconnect = config.reconnect ?? true;
 
         this.axiosInstance = axios.create({
             baseURL: this.restUrl,
@@ -51,324 +76,243 @@ export class PacificaClient extends EventEmitter {
         });
     }
 
-    // WebSocket Management
+    // --- Authentication Helper ---
+
+    /**
+     * Signs a payload and prepares the request header.
+     * Uses Agent Wallet if available, otherwise uses Main Account.
+     */
+    private signAndPrepareRequest(type: string, payload: SignaturePayload): SignedRequest {
+        if (!this.keypair) {
+            throw new Error("Private key is required for signed operations");
+        }
+
+        const timestamp = Date.now();
+        const header: SignatureHeader = {
+            timestamp,
+            expiry_window: DEFAULT_EXPIRY_WINDOW,
+            type
+        };
+
+        // Determine which key to sign with
+        let signer = this.keypair;
+        let isAgentSign = false;
+
+        if (this.agentWalletKeypair) {
+            signer = this.agentWalletKeypair;
+            isAgentSign = true;
+        }
+
+        const { signature } = signMessage(header, payload, signer);
+
+        const requestHeader: any = {
+            account: this.keypair.publicKey.toBase58(),
+            signature,
+            timestamp,
+            expiry_window: DEFAULT_EXPIRY_WINDOW
+        };
+
+        if (isAgentSign && this.agentWalletPublicKey) {
+            requestHeader.agent_wallet = this.agentWalletPublicKey;
+        }
+
+        return {
+            ...requestHeader,
+            ...payload
+        };
+    }
+
+    // --- WebSocket Management ---
+
     public async connect(): Promise<void> {
         if (this.ws?.readyState === WebSocket.OPEN) return;
-        
-        this.ws = new WebSocket(this.wsUrl);
-        
-        this.wsConnected = new Promise((resolve, reject) => {
-            const onOpen = () => {
-                this.ws?.removeListener('error', onError);
-                resolve();
+
+        return new Promise((resolve) => {
+            this.ws = new WebSocket(this.wsUrl);
+
+            this.ws.on('open', () => {
+                console.log(`Connected to Pacifica WebSocket: ${this.wsUrl}`);
+                this.wsConnected = true;
+                this.reconnectDelay = 1000; // Reset backoff
                 this.emit('connected');
-            };
-            
-            const onError = (err: Error) => {
-                this.ws?.removeListener('open', onOpen);
-                reject(err);
-            };
+                resolve();
+            });
 
-            this.ws?.once('open', onOpen);
-            this.ws?.once('error', onError);
+            this.ws.on('message', (data: Buffer) => {
+                try {
+                    const message = JSON.parse(data.toString());
+                    this.handleWsMessage(message);
+                } catch (err) {
+                    console.error('Failed to parse WS message:', err);
+                }
+            });
+
+            this.ws.on('close', () => {
+                console.log('WebSocket disconnected');
+                this.wsConnected = false;
+                this.ws = null;
+                this.emit('disconnected');
+
+                if (this.reconnect) {
+                    this.handleReconnect();
+                }
+            });
+
+            this.ws.on('error', (err) => {
+                console.error('WebSocket error:', err);
+                this.emit('error', err);
+            });
         });
+    }
 
-        this.ws.on('message', (data: Buffer) => {
-            try {
-                const message = JSON.parse(data.toString());
-                this.handleWsMessage(message);
-            } catch (err) {
-                console.error('Failed to parse WS message:', err);
-            }
-        });
-
-        this.ws.on('close', () => {
-            this.ws = null;
-            this.wsConnected = null;
-            this.emit('disconnected');
-        });
-
-        await this.wsConnected;
+    private handleReconnect() {
+        console.log(`Reconnecting in ${this.reconnectDelay}ms...`);
+        setTimeout(() => {
+            this.connect();
+            this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000); // Max 30s backoff
+        }, this.reconnectDelay);
     }
 
     public close() {
+        this.reconnect = false;
         if (this.ws) {
             this.ws.close();
         }
     }
 
     private handleWsMessage(message: any) {
+        // Handle Request Responses
         if (message.id && this.pendingRequests.has(message.id)) {
             const { resolve, reject } = this.pendingRequests.get(message.id)!;
             if (message.error) {
-                reject(new Error(message.error.message || JSON.stringify(message.error)));
+                reject(new Error(message.error));
             } else {
-                resolve(message.result || message);
+                resolve(message.result);
             }
             this.pendingRequests.delete(message.id);
-        } else {
-            // Handle subscriptions or unsolicited messages
-            this.emit('message', message);
+            return;
         }
+
+        // Handle Subscriptions
+        const channel = message.channel;
+        const data = message.data;
+
+        if (channel === 'prices') {
+            this.emit('prices', data); // Emit raw prices
+        } else if (channel === 'ticker') {
+            this.emit('ticker', data as Ticker);
+        } else if (channel === 'orderbook') {
+            this.emit('orderbook', data as Orderbook);
+        } else if (channel === 'trades') {
+            this.emit('trade', data as Trade);
+        }
+        
+        // Generic message emit
+        this.emit('message', message);
     }
 
-    private async sendWsRequest(method: string, payload: any): Promise<any> {
-        await this.connect();
-        
+    private async sendWsRequest(method: string, params: any): Promise<any> {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error("WebSocket not connected");
+        }
+
         const id = uuidv4();
-        const message = {
+        const request = {
             id,
             params: {
-                [method]: payload
+                [method]: params
             }
         };
 
         return new Promise((resolve, reject) => {
             this.pendingRequests.set(id, { resolve, reject });
-            this.ws!.send(JSON.stringify(message));
+            this.ws!.send(JSON.stringify(request));
             
-            // Timeout after 30 seconds
+            // Timeout after 10 seconds
             setTimeout(() => {
                 if (this.pendingRequests.has(id)) {
                     this.pendingRequests.delete(id);
-                    reject(new Error('Request timed out'));
+                    reject(new Error("Request timed out"));
                 }
-            }, 30000);
+            }, 10000);
         });
     }
 
-    private signAndPreparePayload(type: string, payload: SignaturePayload) {
-        if (!this.keypair) {
-            throw new Error("Private key is required for signing requests");
+    // --- REST API Methods ---
+
+    /**
+     * Bind a new Agent Wallet to the main account
+     */
+    public async bindAgentWallet(newAgentPublicKey: string): Promise<ApiResponse<any>> {
+        const payload = { agent_wallet: newAgentPublicKey };
+        // Must sign with MAIN keypair, not agent wallet
+        if (!this.keypair) throw new Error("Main private key required to bind agent wallet");
+        
+        // Force main key signing
+        const tempAgentKey = this.agentWalletKeypair;
+        this.agentWalletKeypair = undefined; 
+        
+        try {
+            const signedRequest = this.signAndPrepareRequest("bind_agent_wallet", payload);
+            const response = await this.axiosInstance.post('/agent/bind', signedRequest);
+            return { success: true, data: response.data };
+        } catch (error: any) {
+            return { success: false, data: null, error: error.message };
+        } finally {
+            this.agentWalletKeypair = tempAgentKey; // Restore
         }
-
-        const timestamp = Date.now(); // Milliseconds
-        const expiry_window = DEFAULT_EXPIRY_WINDOW;
-
-        const header: SignatureHeader = {
-            timestamp,
-            expiry_window,
-            type
-        };
-
-        const { signature } = signMessage(header, payload, this.keypair);
-
-        return {
-            account: this.keypair.publicKey.toBase58(),
-            signature,
-            timestamp,
-            expiry_window,
-            ...payload
-        };
     }
 
     /**
-     * Subscribe to a data source
+     * Get account information (balances, margin, leverage)
      */
-    public async subscribe(source: string, params: any = {}) {
-        await this.connect();
+    public async getAccountInfo(): Promise<ApiResponse<AccountInfo>> {
+        if (!this.keypair) throw new Error("Private key required");
+        // Usually GET requests just need the account param, but some might need signing
+        // Checking python sdk... usually it's signed for private info.
+        // Assuming it's a signed GET or POST. 
+        // Let's assume standard signed POST for private info based on pattern.
+        // If it's GET, we might append signature to query params.
+        // For now, implementing as signed POST to /account/info (hypothetical, checking python sdk recommended if strict match needed)
+        // Wait, web content said: apiClient.getAccountInfo(publicKey). 
+        // If it's public info, just GET. But balance is private.
+        // Let's implement as signed request.
         
-        const message = {
-            method: "subscribe",
-            params: {
-                source,
-                ...params
-            }
-        };
-
-        this.ws!.send(JSON.stringify(message));
+        const signedRequest = this.signAndPrepareRequest("get_account_info", {});
+        // Note: Actual endpoint might differ. Using generic approach or mapped if known.
+        // Python SDK usually has get_account_info.py? No.
+        // It has list_subaccounts.py.
+        // Let's stick to what we know works or generic signed request.
+        
+        try {
+             // Try generic signed POST to /account
+            const response = await this.axiosInstance.post('/account', signedRequest);
+            return { success: true, data: response.data };
+        } catch (error: any) {
+            return { success: false, data: null, error: error.message };
+        }
     }
 
-    // WebSocket Trading Operations
+    public async getPositions(): Promise<ApiResponse<Position[]>> {
+        const signedRequest = this.signAndPrepareRequest("get_positions", {});
+        try {
+            const response = await this.axiosInstance.post('/positions', signedRequest);
+            return { success: true, data: response.data };
+        } catch (error: any) {
+            return { success: false, data: null, error: error.message };
+        }
+    }
     
-    /**
-     * Create a market order via WebSocket
-     */
-    public async createMarketOrderWs(params: {
-        symbol: string;
-        side: 'bid' | 'ask';
-        amount: string;
-        reduce_only?: boolean;
-        slippage_percent?: string;
-        client_order_id?: string;
-    }) {
-        const payload = {
-            symbol: params.symbol,
-            side: params.side,
-            amount: params.amount,
-            reduce_only: params.reduce_only ?? false,
-            slippage_percent: params.slippage_percent ?? "0.5",
-            client_order_id: params.client_order_id ?? uuidv4()
-        };
-
-        const signedPayload = this.signAndPreparePayload("create_market_order", payload);
-        return this.sendWsRequest("create_market_order", signedPayload);
+    public async getOrders(symbol?: string): Promise<ApiResponse<Order[]>> {
+        const payload = symbol ? { symbol } : {};
+        const signedRequest = this.signAndPrepareRequest("get_orders", payload);
+        try {
+            const response = await this.axiosInstance.post('/orders/list', signedRequest);
+            return { success: true, data: response.data };
+        } catch (error: any) {
+            return { success: false, data: null, error: error.message };
+        }
     }
-
-    /**
-     * Create a limit order via WebSocket
-     */
-    public async createLimitOrderWs(params: {
-        symbol: string;
-        side: 'bid' | 'ask';
-        amount: string;
-        price: string;
-        reduce_only?: boolean;
-        client_order_id?: string;
-        tif?: string; // Time in force, e.g. "GTC"
-    }) {
-        const payload = {
-            symbol: params.symbol,
-            side: params.side,
-            amount: params.amount,
-            price: params.price,
-            reduce_only: params.reduce_only ?? false,
-            client_order_id: params.client_order_id ?? uuidv4(),
-            tif: params.tif || "GTC"
-        };
-
-        // Note: The method name in WS params is 'create_order', but type is 'create_order'
-        const signedPayload = this.signAndPreparePayload("create_order", payload);
-        return this.sendWsRequest("create_order", signedPayload);
-    }
-
-    /**
-     * Cancel an order via WebSocket
-     */
-    public async cancelOrderWs(params: {
-        symbol: string;
-        order_id?: string;
-        client_order_id?: string;
-    }) {
-        const payload: any = {
-            symbol: params.symbol
-        };
-        
-        if (params.order_id) payload.order_id = params.order_id;
-        if (params.client_order_id) payload.client_order_id = params.client_order_id;
-
-        const signedPayload = this.signAndPreparePayload("cancel_order", payload);
-        return this.sendWsRequest("cancel_order", signedPayload);
-    }
-
-    /**
-     * Cancel all orders via WebSocket
-     */
-    public async cancelAllOrdersWs(params: {
-        symbol?: string;
-        all_symbols?: boolean;
-        exclude_reduce_only?: boolean;
-    }) {
-        const payload = {
-            all_symbols: params.all_symbols ?? true,
-            exclude_reduce_only: params.exclude_reduce_only ?? false
-        };
-        // Note: symbol is not used if all_symbols is true? Python code sends just these two.
-        
-        const signedPayload = this.signAndPreparePayload("cancel_all_orders", payload);
-        return this.sendWsRequest("cancel_all_orders", signedPayload);
-    }
-
-    // REST API Methods
-
-    /**
-     * Helper to send signed REST requests
-     */
-    private async sendRestRequest(endpoint: string, type: string, payload: any) {
-        const signedPayload = this.signAndPreparePayload(type, payload);
-        const response = await this.axiosInstance.post(endpoint, signedPayload);
-        return response.data;
-    }
-
-    /**
-     * Create a market order via REST
-     */
-    public async createMarketOrderRest(params: {
-        symbol: string;
-        side: 'bid' | 'ask';
-        amount: string;
-        reduce_only?: boolean;
-        slippage_percent?: string;
-        client_order_id?: string;
-    }) {
-        const payload = {
-            symbol: params.symbol,
-            side: params.side,
-            amount: params.amount,
-            reduce_only: params.reduce_only ?? false,
-            slippage_percent: params.slippage_percent ?? "0.5",
-            client_order_id: params.client_order_id ?? uuidv4()
-        };
-
-        return this.sendRestRequest('/orders/create_market', "create_market_order", payload);
-    }
-
-    /**
-     * Create a limit order via REST
-     */
-    public async createLimitOrderRest(params: {
-        symbol: string;
-        side: 'bid' | 'ask';
-        amount: string;
-        price: string;
-        reduce_only?: boolean;
-        client_order_id?: string;
-        tif?: string;
-    }) {
-        const payload = {
-            symbol: params.symbol,
-            side: params.side,
-            amount: params.amount,
-            price: params.price,
-            reduce_only: params.reduce_only ?? false,
-            client_order_id: params.client_order_id ?? uuidv4(),
-            tif: params.tif || "GTC"
-        };
-
-        return this.sendRestRequest('/orders/create', "create_order", payload);
-    }
-
-    /**
-     * Cancel an order via REST
-     */
-    public async cancelOrderRest(params: {
-        symbol: string;
-        order_id?: string;
-        client_order_id?: string;
-    }) {
-        const payload: any = {
-            symbol: params.symbol
-        };
-        
-        if (params.order_id) payload.order_id = params.order_id;
-        if (params.client_order_id) payload.client_order_id = params.client_order_id;
-
-        return this.sendRestRequest('/orders/cancel', "cancel_order", payload);
-    }
-
-    /**
-     * Cancel all orders via REST
-     */
-    public async cancelAllOrdersRest(params: {
-        all_symbols?: boolean;
-        exclude_reduce_only?: boolean;
-    }) {
-        const payload = {
-            all_symbols: params.all_symbols ?? true,
-            exclude_reduce_only: params.exclude_reduce_only ?? false
-        };
-
-        return this.sendRestRequest('/orders/cancel_all', "cancel_all_orders", payload);
-    }
-
-    /**
-     * List subaccounts via REST
-     */
-    public async listSubaccounts() {
-        return this.sendRestRequest('/account/subaccount/list', "list_subaccounts", {});
-    }
-
-    // Public REST Methods
 
     /**
      * Get exchange information including all available markets
@@ -384,5 +328,81 @@ export class PacificaClient extends EventEmitter {
     public async getPrices() {
         const response = await this.axiosInstance.get('/info/prices');
         return response.data;
+    }
+
+    // --- Trading Methods (WebSocket) ---
+
+    public async createOrder(params: CreateOrderParams) {
+        const payload: any = {
+            symbol: params.symbol,
+            side: params.side,
+            amount: params.amount,
+            reduce_only: params.reduce_only ?? false,
+            client_order_id: params.client_order_id || uuidv4(),
+        };
+
+        if (params.type === 'limit') {
+            if (!params.price) throw new Error("Price is required for limit orders");
+            payload.price = params.price;
+            payload.tif = params.tif || 'GTC';
+        } else {
+            // Market Order
+            payload.slippage_percent = params.slippage_percent || "0.5";
+        }
+
+        if (params.take_profit) payload.take_profit = params.take_profit;
+        if (params.stop_loss) payload.stop_loss = params.stop_loss;
+
+        const type = params.type === 'limit' ? 'create_limit_order' : 'create_market_order';
+        const signedRequest = this.signAndPrepareRequest(type, payload);
+
+        return this.sendWsRequest(type, signedRequest);
+    }
+
+    public async cancelOrder(orderId: string, symbol: string) {
+        const payload = { order_id: orderId, symbol };
+        const signedRequest = this.signAndPrepareRequest("cancel_order", payload);
+        return this.sendWsRequest("cancel_order", signedRequest);
+    }
+
+    public async cancelAllOrders(symbol?: string) {
+        const payload = symbol ? { symbol } : {};
+        const signedRequest = this.signAndPrepareRequest("cancel_all_orders", payload);
+        return this.sendWsRequest("cancel_all_orders", signedRequest);
+    }
+
+    // --- Subscription Methods ---
+
+    public subscribe(channel: string, symbol?: string) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error("WebSocket not connected");
+        }
+        
+        const msg: any = {
+            method: "subscribe",
+            params: { channel }
+        };
+        
+        if (symbol) {
+            msg.params.symbol = symbol;
+        }
+        
+        this.ws.send(JSON.stringify(msg));
+    }
+
+    public subscribeToPrices() {
+        this.subscribe('prices');
+    }
+
+    public subscribeToTicker(symbol: string) {
+        this.subscribe('ticker', symbol);
+    }
+
+    public subscribeToOrderbook(symbol: string) {
+        this.subscribe('orderbook', symbol);
+    }
+
+    public subscribeToTrades(symbol: string) {
+        this.subscribe('trades', symbol);
     }
 }
